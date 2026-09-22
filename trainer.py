@@ -3,8 +3,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
-from data_loader import JobsDataset, IHDPDataset
 
 # NumPy 2.0 removed np.trapz in favour of np.trapezoid. Resolve once so the code runs
 # on either major version.
@@ -101,87 +99,6 @@ def BCAUSS_loss_components(
     return vanilla_loss, bal_loss
 
 
-# ==============================
-# ==============================
-def estimate_potential_outcomes(model, dataset, device, y_scaler=None, batch_size=128, verbose=False):
-    model.eval()
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
-    all_y0, all_y1, all_yf, all_t, all_e = [], [], [], [], []
-
-    real_dataset = dataset.dataset if hasattr(dataset, 'dataset') else dataset
-
-    with torch.no_grad():
-        for batch in loader:
-            y_f_scaled = None
-            if isinstance(real_dataset, JobsDataset):
-                x, t, y_f_scaled, e = batch
-                all_e.append(e.cpu())
-            elif isinstance(real_dataset, IHDPDataset):
-                if len(batch) == 4:
-                    x, t, y_f_scaled, tau = batch
-                else:
-                    x, t, y_f_scaled = batch
-            else:
-                x, t, y_f_scaled = batch
-
-            y_f = y_f_scaled.cpu()
-            if isinstance(real_dataset, IHDPDataset) and y_scaler is not None:
-                y_f = torch.from_numpy(y_scaler.inverse_transform(y_f_scaled.cpu().numpy())).to(torch.float32)
-
-            x = x.to(device)
-            all_yf.append(y_f)
-            all_t.append(t.cpu())
-
-            try:
-                out = model(x)
-                if isinstance(out, (tuple, list)):
-                    out = out[0]
-                y0_hat_scaled = out[:, 0].detach().cpu()
-                y1_hat_scaled = out[:, 1].detach().cpu()
-            except Exception as e:
-                raise RuntimeError(f"Model does not support potential outcome estimation: {e}")
-
-            if y_scaler is not None:
-                y0_hat_np = y0_hat_scaled.reshape(-1, 1).numpy()
-                y1_hat_np = y1_hat_scaled.reshape(-1, 1).numpy()
-                y0_hat_orig = torch.from_numpy(y_scaler.inverse_transform(y0_hat_np)).to(torch.float32)
-                y1_hat_orig = torch.from_numpy(y_scaler.inverse_transform(y1_hat_np)).to(torch.float32)
-                all_y0.append(y0_hat_orig.reshape(-1, 1))
-                all_y1.append(y1_hat_orig.reshape(-1, 1))
-            else:
-                all_y0.append(y0_hat_scaled.reshape(-1, 1))
-                all_y1.append(y1_hat_scaled.reshape(-1, 1))
-
-    y0_all = torch.cat(all_y0, dim=0).numpy().reshape(-1, 1)
-    y1_all = torch.cat(all_y1, dim=0).numpy().reshape(-1, 1)
-    yf_all = torch.cat(all_yf, dim=0).numpy().reshape(-1, 1)
-    t_all = torch.cat(all_t, dim=0).numpy().reshape(-1, 1)
-
-    if all_e:
-        e_all = torch.cat(all_e, dim=0).numpy().reshape(-1, 1)
-        return y0_all, y1_all, yf_all, t_all, e_all
-    else:
-        return y0_all, y1_all, yf_all, t_all
-
-
-def compute_att_error(y1_hat, y0_hat, t, y_f, e):
-    att_hat = np.mean((y1_hat - y0_hat)[t.reshape(-1) == 1])
-    treat_rct = y_f[(t.reshape(-1) == 1) & (e.reshape(-1) == 1)].mean()
-    control_rct = y_f[(t.reshape(-1) == 0) & (e.reshape(-1) == 1)].mean()
-    att_rct = treat_rct - control_rct
-    error = abs(att_hat - att_rct)
-    return (error, att_hat, att_rct)
-
-
-def evaluate_jobs(model, loader, device, y_scaler=None):
-    result = estimate_potential_outcomes(model, loader.dataset, device, y_scaler=y_scaler)
-    if len(result) == 5:
-        y0, y1, yf, t, e = result
-    else:
-        return (np.nan, np.nan, np.nan)
-    return compute_att_error(y1, y0, t, yf, e)
-
-
 def model_dimension_check(model, loader, device):
     print("\n=== model dimension check ===")
     for batch in loader:
@@ -200,48 +117,40 @@ def model_dimension_check(model, loader, device):
     print("=== end of check ===\n")
 
 
-def evaluate(model, loader, device, y_scaler=None):
-    model.eval()
-    all_tau_pred, all_tau_true = [], []
-    with torch.no_grad():
-        for batch in loader:
-            if len(batch) == 4:
-                x, t, yf_scaled, tau_true = batch
-            else:
-                x, t, yf_scaled = batch
-                tau_true = None
-            x = x.to(device)
-            pred = model(x)
-            if isinstance(pred, tuple): pred = pred[0]
-            y0_pred_scaled, y1_pred_scaled = pred[:, 0:1], pred[:, 1:2]
-            if y_scaler is not None:
-                y0_pred_orig = y_scaler.inverse_transform(y0_pred_scaled.cpu().numpy())
-                y1_pred_orig = y_scaler.inverse_transform(y1_pred_scaled.cpu().numpy())
-            else:
-                y0_pred_orig = y0_pred_scaled.cpu().numpy()
-                y1_pred_orig = y1_pred_scaled.cpu().numpy()
-            tau_pred = (y1_pred_orig - y0_pred_orig).flatten()
-            all_tau_pred.append(tau_pred)
-            if tau_true is not None:
-                all_tau_true.append(tau_true.cpu().numpy().flatten())
+### ========================================== ###
+### ========================================== ###
+### ========================================== ###
+### ========================================== ###
+def procinis(rank_score, reward, t):
+    order = np.argsort(rank_score)[::-1]
+    r_sorted = reward[order]
+    t_sorted = t[order]
 
-    if len(all_tau_pred) == 0: return 0.0, 0.0
-    all_tau_pred = np.concatenate(all_tau_pred)
-    if len(all_tau_true) > 0:
-        all_tau_true = np.concatenate(all_tau_true)
-        m = min(len(all_tau_pred), len(all_tau_true))
-        pehe = float(np.sqrt(np.mean((all_tau_pred[:m] - all_tau_true[:m]) ** 2)))
-        ate = float(abs(np.mean(all_tau_pred[:m]) - np.mean(all_tau_true[:m])))
-    else:
-        pehe = float(np.sqrt(np.mean(all_tau_pred ** 2)))
-        ate = float(abs(np.mean(all_tau_pred)))
-    return pehe, ate
+    is_t = t_sorted == 1
+    is_good = r_sorted == 1
+
+    cum_t1 = np.cumsum(is_t & is_good)
+    cum_t0 = np.cumsum(is_t & ~is_good)
+    cum_c1 = np.cumsum(~is_t & is_good)
+    cum_c0 = np.cumsum(~is_t & ~is_good)
+
+    tot_t1 = max(cum_t1[-1], 1e-8)
+    tot_t0 = max(cum_t0[-1], 1e-8)
+    tot_c1 = max(cum_c1[-1], 1e-8)
+    tot_c0 = max(cum_c0[-1], 1e-8)
+
+    n = len(reward)
+    ks = np.clip(np.round(np.arange(2, 101, 2) / 100.0 * n).astype(int), 1, n)
+
+    x_axis = 0.5 * (cum_t0[ks - 1] / tot_t0 + cum_c1[ks - 1] / tot_c1)
+    y_axis = 0.5 * (cum_t1[ks - 1] / tot_t1 + cum_c0[ks - 1] / tot_c0)
+
+    x_axis = np.concatenate([[0.0], x_axis])
+    y_axis = np.concatenate([[0.0], y_axis])
+
+    return float(_trapezoid(y_axis, x_axis))
 
 
-### ========================================== ###
-### ========================================== ###
-### ========================================== ###
-### ========================================== ###
 def evaluate_rhc_uplift(model, loader, device):
     model.eval()
     all_cate, all_y, all_t = [], [], []
@@ -295,8 +204,9 @@ def evaluate_rhc_uplift(model, loader, device):
 
     net_auuc = auuc - random_uplift_area
     net_qini = qini_area - random_qini_area
+    procinis_area = procinis(all_cate, y_reward, all_t)
 
-    return net_auuc, net_qini
+    return net_auuc, net_qini, procinis_area
 
 
 def evaluate_positive_uplift(model, loader, device):
@@ -351,8 +261,9 @@ def evaluate_positive_uplift(model, loader, device):
 
     net_auuc = auuc - random_uplift_area
     net_qini = qini_area - random_qini_area
+    procinis_area = procinis(all_cate, y_reward, all_t)
 
-    return net_auuc, net_qini
+    return net_auuc, net_qini, procinis_area
 
 
 
@@ -367,19 +278,20 @@ def train(model, train_loader, valid_loader, device,
           epochs=100, lr=1e-3,
           patience=40, verbose=True,
           clip_grad_norm=0.8,
-          dataset_type="ihdp",
-          y_scaler=None,
           weight_decay=1e-5,
           lambda_rank=0.3,
           lambda_bal=1.0,
           backbone_type="dragonnet",
-          lambda_rlearner=1.0):
+          lambda_rlearner=1.0,
+          eval_uplift=None):
     """Train with early stopping on the validation fold.
 
     Objective: L_total = L_BCAUSS + lambda_rank * L_rank + lambda_rlearner * L_rlearner,
     with L_BCAUSS = L_MTL + lambda_bal * L_bal. The learning rate is constant.
     """
-    task_type = "classification" if dataset_type.lower() in ("rhc", "hillstrom") else "regression"
+    if eval_uplift is None:
+        eval_uplift = evaluate_rhc_uplift
+    task_type = "classification"
 
     mtl = MultiTaskLoss(num_tasks=2).to(device)
 
@@ -391,11 +303,9 @@ def train(model, train_loader, valid_loader, device,
 
     history = {
         "train_loss": [], "valid_loss": [],
-        "train_pehe": [], "valid_pehe": [],
-        "train_ate": [], "valid_ate": [],
-        "train_pehe_history": [], "valid_pehe_history": [],
-        "train_ate_history": [], "valid_ate_history": [],
-        "train_att_history": [], "valid_att_history": []
+        "train_auuc_history": [], "valid_auuc_history": [],
+        "train_qini_history": [], "valid_qini_history": [],
+        "train_procinis_history": [], "valid_procinis_history": []
     }
 
     best_val_metric = -float('inf')
@@ -502,112 +412,36 @@ def train(model, train_loader, valid_loader, device,
         history["train_loss"].append(avg_train_loss)
         history["valid_loss"].append(avg_val_loss)
 
-        sigmas = mtl.get_weights()
-        sigma_y, sigma_t = sigmas[0], sigmas[1]
+        train_auuc, train_qini, train_procinis = eval_uplift(model, train_loader, device)
+        valid_auuc, valid_qini, valid_procinis = eval_uplift(model, valid_loader, device)
 
-        if dataset_type.lower() == "ihdp":
-            train_pehe, train_ate = evaluate(model, train_loader, device, y_scaler=y_scaler)
-            valid_pehe, valid_ate = evaluate(model, valid_loader, device, y_scaler=y_scaler)
-            history["train_pehe"].append(train_pehe)
-            history["train_ate"].append(train_ate)
-            history["valid_pehe"].append(valid_pehe)
-            history["valid_ate"].append(valid_ate)
-            history["train_pehe_history"].append(train_pehe)
-            history["train_ate_history"].append(train_ate)
-            history["valid_pehe_history"].append(valid_pehe)
-            history["valid_ate_history"].append(valid_ate)
+        history["train_auuc_history"].append(train_auuc)
+        history["valid_auuc_history"].append(valid_auuc)
+        history["train_qini_history"].append(train_qini)
+        history["valid_qini_history"].append(valid_qini)
+        history["train_procinis_history"].append(train_procinis)
+        history["valid_procinis_history"].append(valid_procinis)
 
-            if verbose and (epoch % 10 == 0 or epoch == epochs - 1):
-                print(
-                    f"Epoch {epoch + 1}/{epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | "
-                    f"σ_y: {sigma_y:.2f} σ_t: {sigma_t:.2f} | "
-                    f"Tr PEHE: {train_pehe:.4f} | Val PEHE: {valid_pehe:.4f}")
-
-
-        elif dataset_type.lower() == "jobs":
-
-            train_att = evaluate_jobs(model, train_loader, device, y_scaler=y_scaler)
-
-            valid_att = evaluate_jobs(model, valid_loader, device, y_scaler=y_scaler)
-
-            history["train_att_history"].append(train_att)
-
-            history["valid_att_history"].append(valid_att)
-
-            if verbose and (epoch % 10 == 0 or epoch == epochs - 1):
-                print(
-
-                    f"Epoch {epoch + 1}/{epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | "
-
-                    f"σ_y: {sigma_y:.2f} σ_t: {sigma_t:.2f} | "
-
-                    f"Train ATT: {train_att[0]:.4f} | Val ATT: {valid_att[0]:.4f}")
-
-
-        elif dataset_type.lower() == "rhc":
-
-            train_auuc, train_qini = evaluate_rhc_uplift(model, train_loader, device)
-
-            valid_auuc, valid_qini = evaluate_rhc_uplift(model, valid_loader, device)
-
-
-            if "train_auuc_history" not in history:
-                history["train_auuc_history"] = []
-
-                history["valid_auuc_history"] = []
-
-                history["train_qini_history"] = []
-
-                history["valid_qini_history"] = []
-
-            history["train_auuc_history"].append(train_auuc)
-
-            history["valid_auuc_history"].append(valid_auuc)
-
-            history["train_qini_history"].append(train_qini)
-
-            history["valid_qini_history"].append(valid_qini)
-
-            if verbose and (epoch % 10 == 0 or epoch == epochs - 1):
-                print(
-
-                    f"Epoch {epoch + 1}/{epochs} | Tr Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | "
-
-                    f"Val AUUC: {valid_auuc:.4f} | Val Qini: {valid_qini:.4f}")
-
-
-
-        else:
-            history["train_pehe"].append(None)
-            history["train_ate"].append(None)
-            history["valid_pehe"].append(None)
-            history["valid_ate"].append(None)
+        if verbose and (epoch % 10 == 0 or epoch == epochs - 1):
+            print(
+                f"Epoch {epoch + 1}/{epochs} | Tr Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f} | "
+                f"Val AUUC: {valid_auuc:.4f} | Val Qini: {valid_qini:.4f}")
 
         # ==============================
-        # Checkpoint selection: validation Net Qini on RHC, negative validation loss
-        # on the other datasets. Reads only the validation quantities computed above.
+        # Checkpoint selection: validation Net Qini. Reads only the validation
+        # quantities computed above.
         # ==============================
-        if 'valid_qini' in locals():
-            current_metric = valid_qini
-            metric_name = "Net Qini"
-        else:
-            current_metric = -avg_val_loss
-            metric_name = "Negative Val Loss"
-
-        if current_metric > best_val_metric + 1e-6:
-            best_val_metric = current_metric
+        if valid_qini > best_val_metric + 1e-6:
+            best_val_metric = valid_qini
             best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             no_improve_count = 0
             if verbose:
-                if 'valid_auuc' in locals():
-                    print(f"New best model! Val {metric_name}: {current_metric:.4f} (AUUC: {valid_auuc:.4f})")
-                else:
-                    print(f"New best model! Val {metric_name}: {current_metric:.4f}")
+                print(f"New best model! Val Net Qini: {valid_qini:.4f} (AUUC: {valid_auuc:.4f})")
         else:
             no_improve_count += 1
             if no_improve_count >= patience:
                 if verbose:
-                    print(f"Early stopping at epoch {epoch + 1} | Best Val {metric_name}: {best_val_metric:.4f}")
+                    print(f"Early stopping at epoch {epoch + 1} | Best Val Net Qini: {best_val_metric:.4f}")
                 break
 
     if best_model_state is not None:
